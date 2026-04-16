@@ -1,0 +1,37 @@
+{
+  "migration_source": "OracleDB",
+  "migration_target": "BigQuery",
+  "type_mappings": {
+    "NUMBER(p,s)": "NUMERIC",
+    "NUMBER": "FLOAT64",
+    "VARCHAR2": "STRING",
+    "CHAR": "STRING",
+    "DATE": "DATETIME",
+    "TIMESTAMP": "TIMESTAMP",
+    "CLOB": "STRING",
+    "BLOB": "BYTES",
+    "INTEGER": "INT64",
+    "BOOLEAN": "BOOL",
+    "LONG": "STRING",
+    "RAW": "BYTES",
+    "NVARCHAR2": "STRING",
+    "NCHAR": "STRING",
+    "FLOAT": "FLOAT64"
+  },
+  "transformation_rules": {
+    "partitioning": {
+      "row_threshold": 1000000,
+      "default_column_types": ["DATE", "TIMESTAMP", "DATETIME"],
+      "fallback_partition": "_PARTITIONTIME"
+    },
+    "clustering": {
+      "max_columns": 4,
+      "source_criteria": "procedure_dependency_analysis"
+    },
+    "formatting": {
+      "table_name_casing": "lower",
+      "output_path_pattern": "models/raw/{table_name}.sql",
+      "source_yml_path": "models/raw/sources.yml"
+    }
+  }
+}

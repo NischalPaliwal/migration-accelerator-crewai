@@ -1,0 +1,29 @@
+[project]
+name = "oraclebigquerymigrationcrew"
+version = "0.1.0"
+description = "OracleBigQueryMigrationCrew using crewAI"
+authors = [{ name = "Nischal Paliwal", email = "you@example.com" }]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "crewai[tools]==1.12.2",
+    "google-cloud-bigquery>=3.41.0",
+    "oracledb",
+    "python-dotenv",
+    "sqlglot>=30.4.2",
+    "filelock"
+]
+
+[project.scripts]
+oraclebigquerymigrationcrew = "oraclebigquerymigrationcrew.main:run"
+run_crew = "oraclebigquerymigrationcrew.main:run"
+train = "oraclebigquerymigrationcrew.main:train"
+replay = "oraclebigquerymigrationcrew.main:replay"
+test = "oraclebigquerymigrationcrew.main:test"
+run_with_trigger = "oraclebigquerymigrationcrew.main:run_with_trigger"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.crewai]
+type = "crew"

@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "migration-accelerator-492716",
+  "private_key_id": "b23e0a9242e2ca7f634f2121935300ac676676d5",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDLacA+0fI/njH3\nIuMaV6PtmCQiFnfTdDS9LOJ+nbe4ox2tZMDUtf1Y4YADNVv6zMAhCTJh/z4wkjT2\n2KYivAK6glsDHBijCEWPPMfRPQ3j4JC+/lCLIrb/GtqDzLjxz6vUzY7oF3Gh7UyX\njKWn/Iqp8lmCpVS/RMzZf17vVFr/e5AJWyN7pQN+6sQI3kyw6yr6Wab+UvAKMmLE\nAl4GT7LU4jrwxmkLtVqD3sDaai6YW244TY25g864Wr/qC/PWlbOMLZn9tl2wg3in\nfRWtVHjViRMAX1oQCf32Op4Fo0traiZo1SgJS0BA6QrsS5PLlwkuXzFeqXo7gxF4\nEXrvXDB5AgMBAAECggEATajxQcqr/0fpcZ47MGp3ZpWobe9ADlYWcIc7bfXPF8oG\n4ZVO3achs5ZcZl0v4b/cNoCpYKqvVqHrYLb0Ltyy+fwcvUIz0cKts/MTorn5nJ+3\nA4RawdQeI6Vf+ePmVEPiKZvVTJzuwFC15kJHWKxdUGb7b5qpkWC2CO/NEfiVyWX3\ny4ZH9CPpcGd3n9N2+ZmUeYRjEkUULj8EeydGr48iiP4F+Bsz/rBXuTMpG6MObbY3\npV02w5ZwZXGDeRlA6DJkIySwARVrF4iGE06eGVF6BXE7VGlRbVCBpgxk+Kd5Aps0\n9SwhLnGfxqhqDvCn0QBlVN6YVnqigQLlhcX8/LlgJQKBgQDzWsUF8hLKQdSbCCcj\nUYMkJVr3gy6KMZjDjwEuCgJjWCuSTy0g+btK66eDj2SIp+KEA10/nCPACh7H/+uQ\n0hevfYSdIAODDTDqiUOFeZw3zOd8/KXdI7BFkXXEv9efyMs0WovDvX5ro3XQdVHN\naPBUR4F0+XIcFsDn0bJtNNWOhwKBgQDV+6imWPFULLefJu3KA+vzHXcfoYdkbksz\ncrkUARzSqaeEQdyaZ0hmCMCP7IiJs/pG8DSecYwC+iG5yH+pXTSp2gqyOFL5SBKP\nzDko/P8NSLp1+9G88eWFyI4un13zyUsahwGS7MsUJjDe0YQtewKPkJCj4VLRm86W\noMJfURkI/wKBgB7nwSvPIWnEUH7b2zSWDoSRperXIxrzz4XObITvSnxZXzc2jPGq\nJYoPQXfoxwi/4XmIf9grOTMTVfNqYf1DYTStSSE3RprnGvY+NnAGELvZbvClmV7r\nQGClZ4J0JqspMf1VHnjeYObEnJq7u4bNs+/QIPW9FCvTC+6k5/cMha6TAoGBAMWf\nK/ylfAvPWK5Fl6rQwGLBPbkaxx37trwHIeLVvDbatHkzEngPFxAU2TKSsu7qJyTI\nxu/l0fcV53vbLfvOtsp/Mw2xcwACjhH7/HZcYXl1R6+bJ/MmPGG3/YgVawGxUAlp\n0gxNYKh1NQEz4qzWRGEulEal3IT1LnBye9Dn5wUlAoGAdyMYTntJ3yaH4S86PkzT\nCTFnhSHgEcVUXVMcYjDdUSRqgs6oNGctMJIEi2w93i7EJrLClOHQ87UIiYYRqnw8\nVOC6CAj/Ei6K8+JOmseU1Pow58OlT//uUPsbsbH0MCB3LLTatqXvpfB+0yfrSjyz\nphtvAsM1VFzTzLZwYqFXrs4=\n-----END PRIVATE KEY-----\n",
+  "client_email": "dbt-user@migration-accelerator-492716.iam.gserviceaccount.com",
+  "client_id": "110970255631868003915",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/dbt-user%40migration-accelerator-492716.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}

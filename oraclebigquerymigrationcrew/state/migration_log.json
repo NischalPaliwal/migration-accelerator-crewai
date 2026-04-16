@@ -1,0 +1,85 @@
+{
+  "GOLD_MONTHLY_METRICS": {
+    "object_name": "GOLD_MONTHLY_METRICS",
+    "status": "DISOVERED",
+    "object_type": "TABLE",
+    "raw_source": "TABLE",
+    "schema": "nischal",
+    "complexity": "HIGH",
+    "migration_strategy": "human_review",
+    "depends_on": [
+      "SYS_STUB_FOR_PURITY_ANALYSIS",
+      "VW_ENRICHED_SALES",
+      "GOLD_MONTHLY_METRICS"
+    ],
+    "row_count": 20,
+    "failure_reason": "Nested cursors or complex SQL",
+    "migration_order_index": 1,
+    "blocked_until": [],
+    "last_updated": "2026-04-16T17:19:01.097869+00:00"
+  },
+  "SRC_PRODUCTS": {
+    "object_name": "SRC_PRODUCTS",
+    "status": "SCHEMA_CONVERTED",
+    "object_type": "TABLE",
+    "raw_source": "CREATE TABLE IF NOT EXISTS `migration-accelerator-492716.nischal.src_products` (\n  `prod_id` INT64 OPTIONS(description=\"Product ID\") ,\n  `prod_name` STRING OPTIONS(description=\"Product Name\") ,\n  `cat_id` INT64 OPTIONS(description=\"Category ID\") ,\n  `base_price` FLOAT64 OPTIONS(description=\"Base Price\") ,\n  `status` STRING OPTIONS(description=\"Status\") ,\n  `updated_at` DATETIME OPTIONS(description=\"Updated At\") \n) OPTIONS(description = \"SRC Products table\") \n",
+    "schema": "nischal",
+    "complexity": "LOW",
+    "migration_strategy": "dbt_model",
+    "depends_on": [],
+    "row_count": 5,
+    "failure_reason": null,
+    "migration_order_index": 3,
+    "blocked_until": [],
+    "last_updated": "2026-04-16T17:20:06.127276+00:00"
+  },
+  "VW_ENRICHED_SALES": {
+    "object_name": "VW_ENRICHED_SALES",
+    "status": "DISOVERED",
+    "object_type": "VIEW",
+    "raw_source": "VIEW",
+    "schema": "nischal",
+    "complexity": "MEDIUM",
+    "migration_strategy": "automated dbt with review",
+    "depends_on": [
+      "SRC_SALES",
+      "SRC_PRODUCTS",
+      "SRC_CATEGORIES"
+    ],
+    "row_count": 5,
+    "failure_reason": null,
+    "migration_order_index": 5,
+    "blocked_until": [],
+    "last_updated": "2026-04-16T17:19:08.067085+00:00"
+  },
+  "SRC_SALES": {
+    "object_name": "SRC_SALES",
+    "status": "SCHEMA_CONVERTED",
+    "object_type": "TABLE",
+    "raw_source": "CREATE TABLE IF NOT EXISTS `migration-accelerator-492716.nischal.src_sales` (\n  `txn_id` INT64 OPTIONS(description=\"Transaction ID\") ,\n  `prod_id` INT64 OPTIONS(description=\"Product ID\") ,\n  `qty` INT64 OPTIONS(description=\"Quantity\") ,\n  `price_paid` FLOAT64 OPTIONS(description=\"Price Paid\") ,\n  `txn_date` DATETIME OPTIONS(description=\"Transaction Date\") ,\n  `store_id` INT64 OPTIONS(description=\"Store ID\") \n) OPTIONS(description = \"SRC Sales table\") \n",
+    "schema": "nischal",
+    "complexity": "LOW",
+    "migration_strategy": "dbt_model",
+    "depends_on": [],
+    "row_count": 5,
+    "failure_reason": null,
+    "migration_order_index": 4,
+    "blocked_until": [],
+    "last_updated": "2026-04-16T17:20:06.195123+00:00"
+  },
+  "SRC_CATEGORIES": {
+    "object_name": "SRC_CATEGORIES",
+    "status": "SCHEMA_CONVERTED",
+    "object_type": "TABLE",
+    "raw_source": "CREATE TABLE IF NOT EXISTS `migration-accelerator-492716.nischal.src_categories` (\n  `cat_id` INT64 OPTIONS(description=\"Category ID\") ,\n  `cat_name` STRING OPTIONS(description=\"Category Name\") ,\n  `dept_code` STRING OPTIONS(description=\"Department Code\") ,\n  `extract_ts` DATETIME OPTIONS(description=\"Extract Timestamp\") \n) OPTIONS(description = \"SRC Categories table\")\n",
+    "schema": "nischal",
+    "complexity": "LOW",
+    "migration_strategy": "dbt_model",
+    "depends_on": [],
+    "row_count": 3,
+    "failure_reason": null,
+    "migration_order_index": 2,
+    "blocked_until": [],
+    "last_updated": "2026-04-16T17:20:06.065288+00:00"
+  }
+}

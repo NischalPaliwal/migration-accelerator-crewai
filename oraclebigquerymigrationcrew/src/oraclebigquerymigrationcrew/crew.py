@@ -112,5 +112,6 @@ class OracleBigQueryMigrationCrew():
             process=Process.hierarchical,
             manager_agent=self.supervisor_agent(),
             verbose=True,
-            knowledge_sources=[knowledge_pdf]
+            knowledge_sources=[knowledge_pdf],
+            checkpoint=True
         )

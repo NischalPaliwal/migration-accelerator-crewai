@@ -54,14 +54,14 @@ classify_complexity_task:
       - No dynamic SQL (no EXECUTE IMMEDIATE)
       - Dependency count: 0 to 3 objects, all tables
 
-    MEDIUM — qualifies for automated PySpark or dbt with review:
+    MEDIUM — qualifies for full automated dbt conversion:
       - Single CURSOR FOR loop
       - Standard MERGE / UPSERT patterns
       - Calls 1 to 2 other procedures (which are themselves LOW)
       - Basic exception handling (WHEN OTHERS)
       - Dependency count: 3 to 8 objects
 
-    HIGH — must be flagged for human review:
+    HIGH — can be flagged for human review (only if too necessary):
       - Nested cursors (cursor inside a cursor)
       - EXECUTE IMMEDIATE or dynamic SQL of any kind
       - Calls to DBMS_* packages (DBMS_OUTPUT, DBMS_SQL, DBMS_SCHEDULER)
@@ -71,12 +71,19 @@ classify_complexity_task:
       - Dependency count: more than 8 objects
       - Any object where automated conversion confidence is below 0.75
 
+    In MEDIUM/HIGH complexity objects, there will be mostly procedures which are refreshing the data inside a
+    table or view (not much complex logic). In that case a simple dbt model can be created as every time
+    that dbt model is run it automatically refreshes the data in target table in BigQuery.
+
+    Never left any table/view depending on any number of objects to human_review unless utmost required.
+    Mostly you will find them not that complex.
+
     Additionally, assign each object a medallion_layer based on the following rules:
       BRONZE  — tables or views whose Oracle name starts with "SRC" or "src".
                 These are raw landing tables/views; they will be sourced directly
                 via dbt source() references and placed under models/bronze/.
       SILVER  — tables or views that transform or enrich Bronze data. This includes
-                Oracle views that join or aggregate SRC/src tables, as well as
+                Oracle views or tables that join or aggregate SRC/src tables, as well as
                 any table that primarily reads from Bronze objects. These will be
                 placed under models/silver/.
       GOLD    — tables or views that aggregate Silver (or Silver + Bronze) data

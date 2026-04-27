@@ -54,7 +54,9 @@ def test():
     Test the crew execution and returns the results.
     """
     inputs = {
-        'oracle_schema': 'nischal'
+        'oracle_schema': 'nischal',
+        'bq_dataset': 'nischal',
+        'gcp_project': 'migration-accelerator-492716'
     }
 
     try:
@@ -79,7 +81,9 @@ def run_with_trigger():
     
     inputs = {
         "crewai_trigger_payload": trigger_payload,
-        'oracle_schema': 'nischal'
+        'oracle_schema': 'nischal',
+        'bq_dataset': 'nischal',
+        'gcp_project': 'migration-accelerator-492716'
     }
 
     try:

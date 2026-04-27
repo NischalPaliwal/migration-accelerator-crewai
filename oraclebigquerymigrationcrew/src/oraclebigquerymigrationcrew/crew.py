@@ -4,7 +4,7 @@ from crewai.agents.agent_builder.base_agent import BaseAgent
 from crewai.knowledge.source.pdf_knowledge_source import PDFKnowledgeSource
 from .tools import list_tables, get_table_ddl, get_proc_body, get_dependencies, count_rows, sample_rows, list_procedures, write_migration_log, read_migration_log, read_config, read_file, write_file, transpile_oracle_to_bq, create_table, list_views, get_view_ddl, dry_run_bq, count_rows_bq, execute_query
 
-knowledge_pdf = PDFKnowledgeSource(file_path="oraclebigquerymigrationcrew\knowledge\oracle_dbt_migration_knowledge_base.pdf")
+knowledge_pdf = PDFKnowledgeSource(file_paths=["oracle_dbt_migration_knowledge_base.pdf"])
 
 @CrewBase
 class OracleBigQueryMigrationCrew():
@@ -63,31 +63,36 @@ class OracleBigQueryMigrationCrew():
     @task
     def discover_oracle_schema_task(self) -> Task:
         return Task(
-            config=self.tasks_config['discover_oracle_schema_task']
+            config=self.tasks_config['discover_oracle_schema_task'],
+            human_input=True
         )
     
     @task
     def classify_complexity_task(self) -> Task:
         return Task(
-            config=self.tasks_config['classify_complexity_task']
+            config=self.tasks_config['classify_complexity_task'],
+            human_input=True
         )
     
     @task
     def convert_schemas_task(self) -> Task:
         return Task(
-            config=self.tasks_config['convert_schemas_task']
+            config=self.tasks_config['convert_schemas_task'],
+            human_input=True
         )
     
     @task
     def convert_low_medium_procs_task(self) -> Task:
         return Task(
-            config=self.tasks_config['convert_low_medium_procs_task']
+            config=self.tasks_config['convert_low_medium_procs_task'],
+            human_input=True
         )
     
     @task
     def validate_migrations_task(self) -> Task:
         return Task(
-            config=self.tasks_config['validate_migrations_task']
+            config=self.tasks_config['validate_migrations_task'],
+            human_input=True
         )
     
     @task

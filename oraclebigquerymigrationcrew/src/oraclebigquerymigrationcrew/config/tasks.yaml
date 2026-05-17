@@ -13,25 +13,42 @@ discover_oracle_schema_task:
     3. For EACH procedure and function found: call get_proc_body to retrieve
        the full PL/SQL source, then call get_dependencies to find every
        object it references. Do not skip any object.
+       During retrieval, inspect the PL/SQL body and tag each object with its
+       detected proc_pattern using these rules:
+         - MERGE_UPSERT    → body contains MERGE INTO or INSERT ... ON CONFLICT patterns
+         - SCD_TYPE_2      → body maintains history columns (effective_date, end_date,
+                             is_current, valid_from, valid_to or similar SCD2 conventions)
+         - HELPER_FUNCTION → object type is FUNCTION and returns a scalar value or
+                             expression; body has no DML on target tables
+         - TABLE_REFRESH   → body is primarily INSERT OVERWRITE, TRUNCATE+INSERT,
+                             DELETE+INSERT, or a simple table population with no
+                             MERGE or SCD2 logic
+         - UNIQUE_LOGIC    → body contains business transformation logic not captured
+                             in any existing table or view definition
+       If multiple patterns are detected, tag all that apply and note the primary one.
     4. For EACH table AND view: call get_table_ddl (for tables) or get_view_ddl (for views)
        to retrieve the full CREATE TABLE / CREATE VIEW statement including
        constraints, indexes and comments.
     5. Write the complete inventory to the migration log using
        write_migration_log. The log entry for each object must include:
-       object_name, object_type (TABLE or VIEW), schema, row_count (tables only),
-       dependency_list, raw_source (proc body, DDL, or view definition),
+       object_name, object_type (TABLE / VIEW / PROCEDURE / FUNCTION), schema,
+       row_count (tables only), dependency_list, raw_source (proc body, DDL, or
+       view definition), proc_pattern (procedures/functions only),
        medallion_layer (BRONZE if name starts with SRC/src, otherwise SILVER_CANDIDATE),
        status=DISCOVERED.
     6. Return a structured summary: total tables found, total views found,
-       total procedures found, total functions found, total unique dependencies identified.
+       total procedures found (broken down by proc_pattern), total functions found,
+       total unique dependencies identified.
     7. Never generate random answers if a particular object is not present.
 
     Schema to scan: {oracle_schema}
   expected_output: >
     A structured discovery report containing:
-    - Total object counts by type (tables, views, procedures, functions)
-    - A complete list of every object discovered with its name, type, dependency count,
-      dependency list, and assigned medallion_layer
+    - Total object counts by type (tables, views, procedures broken down by
+      proc_pattern, functions)
+    - A complete list of every object discovered with its name, type,
+      proc_pattern (where applicable), dependency count, dependency list,
+      and assigned medallion_layer
     - Confirmation that every object has been written to the migration log
       with status=DISCOVERED
     - Any objects that could not be read (with the error reason)
@@ -44,8 +61,52 @@ discover_oracle_schema_task:
 classify_complexity_task:
   description: >
     Read the complete discovery output from the previous task and apply the
-    migration complexity scoring rubric to every Oracle object. Score each
-    object as LOW, MEDIUM, or HIGH using these criteria:
+    migration strategy and complexity scoring rubric to every Oracle object.
+
+    ## PART 1 — PROCEDURE & FUNCTION MIGRATION STRATEGY
+    For every procedure and function, assign a migration_strategy based on
+    the proc_pattern detected during discovery. This is the primary decision
+    — apply it before complexity scoring:
+
+      proc_pattern=TABLE_REFRESH  → migration_strategy=DISCARD
+        Rationale: In dbt, every `dbt run` automatically refreshes all models.
+        Procedures that exist only to populate or refresh a table are fully
+        replaced by the dbt run cycle. No artifact is generated — the target
+        table will be produced by its corresponding dbt model instead.
+        Write status=DISCARDED and discard_reason="Replaced by dbt run cycle"
+        to the migration log. Do NOT process these further.
+
+      proc_pattern=MERGE_UPSERT   → migration_strategy=INCREMENTAL_MODEL
+        Convert the target table of the MERGE INTO statement to a dbt model
+        with materialized='incremental'. The procedure itself is discarded;
+        its upsert logic is expressed directly in the incremental model SQL
+        using dbt's incremental materialisation pattern.
+
+      proc_pattern=SCD_TYPE_2     → migration_strategy=DBT_SNAPSHOT
+        Convert to a dbt snapshot under the snapshots/ directory.
+        Use the 'timestamp' strategy if updated_at or equivalent columns exist,
+        otherwise use the 'check' strategy with all non-key columns.
+        The procedure itself is discarded; dbt snapshot handles history tracking.
+
+      proc_pattern=HELPER_FUNCTION → migration_strategy=DBT_MACRO
+        Oracle functions that return scalar values or expressions become
+        dbt Jinja macros written to macros/<function_name_lower>.sql.
+        Macros are reusable across models via {{ macro_name(...) }}.
+
+      proc_pattern=UNIQUE_LOGIC   → migration_strategy=DBT_MODEL
+        Procedures that contain business transformation logic not captured
+        elsewhere become dbt models in models/silver/ or models/gold/.
+        The medallion layer is determined by what the procedure reads from.
+
+      proc_pattern=multiple / ambiguous → flag for human classification review.
+        Write to human_review_queue with the detected patterns listed.
+
+    ## PART 2 — COMPLEXITY SCORING
+    Apply complexity scoring ONLY to objects with migration_strategy in
+    (INCREMENTAL_MODEL, DBT_SNAPSHOT, DBT_MACRO, DBT_MODEL).
+    Objects with migration_strategy=DISCARD are not scored.
+
+    Score each qualifying object as LOW, MEDIUM, or HIGH:
 
     LOW — qualifies for full automated dbt conversion:
       - Pure SELECT / INSERT / UPDATE with no cursors
@@ -54,14 +115,14 @@ classify_complexity_task:
       - No dynamic SQL (no EXECUTE IMMEDIATE)
       - Dependency count: 0 to 3 objects, all tables
 
-    MEDIUM — qualifies for full automated dbt conversion:
+    MEDIUM — qualifies for automated dbt with review:
       - Single CURSOR FOR loop
       - Standard MERGE / UPSERT patterns
       - Calls 1 to 2 other procedures (which are themselves LOW)
       - Basic exception handling (WHEN OTHERS)
       - Dependency count: 3 to 8 objects
 
-    HIGH — can be flagged for human review (only if too necessary):
+    HIGH — must be flagged for human review:
       - Nested cursors (cursor inside a cursor)
       - EXECUTE IMMEDIATE or dynamic SQL of any kind
       - Calls to DBMS_* packages (DBMS_OUTPUT, DBMS_SQL, DBMS_SCHEDULER)
@@ -71,46 +132,44 @@ classify_complexity_task:
       - Dependency count: more than 8 objects
       - Any object where automated conversion confidence is below 0.75
 
-    In MEDIUM/HIGH complexity objects, there will be mostly procedures which are refreshing the data inside a
-    table or view (not much complex logic). In that case a simple dbt model can be created as every time
-    that dbt model is run it automatically refreshes the data in target table in BigQuery.
-
-    Never left any table/view depending on any number of objects to human_review unless utmost required.
-    Mostly you will find them not that complex.
-
-    Additionally, assign each object a medallion_layer based on the following rules:
+    ## PART 3 — MEDALLION LAYER ASSIGNMENT
+    Assign medallion_layer to tables, views, and DBT_MODEL procedures:
       BRONZE  — tables or views whose Oracle name starts with "SRC" or "src".
-                These are raw landing tables/views; they will be sourced directly
-                via dbt source() references and placed under models/bronze/.
-      SILVER  — tables or views that transform or enrich Bronze data. This includes
-                Oracle views or tables that join or aggregate SRC/src tables, as well as
-                any table that primarily reads from Bronze objects. These will be
-                placed under models/silver/.
-      GOLD    — tables or views that aggregate Silver (or Silver + Bronze) data
-                for reporting, KPIs, or consumer-facing outputs. These will be
-                placed under models/gold/.
+                Sourced via dbt source() and placed under models/bronze/.
+      SILVER  — tables, views, or UNIQUE_LOGIC procedures that transform or
+                enrich Bronze data. Placed under models/silver/.
+      GOLD    — tables, views, or UNIQUE_LOGIC procedures that aggregate Silver
+                data for reporting or KPIs. Placed under models/gold/.
 
-    After scoring, produce a topologically sorted migration order:
-      - Objects with no dependencies on other procs go first
-      - Objects that are depended upon by others go before their dependents
-      - Within the same tier, order by dependency count ascending
-      - BRONZE objects must always precede SILVER objects, which must precede GOLD objects
+    ## PART 4 — TOPOLOGICAL SORT
+    Produce a dependency-ordered migration sequence:
+      - DISCARD objects are removed from the sequence entirely
+      - BRONZE objects always precede SILVER, SILVER always precedes GOLD
+      - Within the same layer, order by dependency count ascending
+      - DBT_SNAPSHOT objects are sequenced after their Bronze source tables
+      - Objects that are depended upon by others appear before their dependents
 
     Write the full classification manifest to the migration log. Each entry
-    must include: complexity, migration_strategy, migration_order_index,
-    medallion_layer, depends_on list, blocked_until list. Tools like
-    write_migration_log and read_migration_log have been provided to let you
-    read and write migration log.
+    must include: complexity (where applicable), migration_strategy,
+    migration_order_index, medallion_layer, depends_on list, blocked_until list,
+    discard_reason (where applicable). Use write_migration_log and
+    read_migration_log tools to read and write the migration log.
+
   expected_output: >
     A migration classification manifest containing:
-    - Count of objects per complexity tier (LOW / MEDIUM / HIGH)
+    - Count of procedures/functions per migration_strategy:
+        DISCARD / INCREMENTAL_MODEL / DBT_SNAPSHOT / DBT_MACRO / DBT_MODEL
+    - Count of DISCARDED objects with their discard_reason
+    - Count of objects per complexity tier (LOW / MEDIUM / HIGH) for
+      non-discarded procedural objects
     - Count of objects per medallion layer (BRONZE / SILVER / GOLD)
-    - Recommended migration strategy per tier
-    - A dependency-ordered list of all objects showing migration sequence and medallion layer
+    - A dependency-ordered list of all non-discarded objects showing
+      migration sequence, migration_strategy, and medallion layer
     - A list of HIGH complexity objects flagged for human review with
       specific reasons why each was scored HIGH
-    - Estimated automation rate: percentage of objects that can be
-      auto-converted vs require human intervention
+    - A list of ambiguous proc_pattern objects added to human_review_queue
+    - Estimated automation rate: percentage of objects fully auto-converted
+      vs requiring human intervention (excluding DISCARDs from denominator)
   agent: classifier_agent
   context:
     - discover_oracle_schema_task
@@ -141,7 +200,7 @@ convert_schemas_task:
     Apply BigQuery partitioning rules:
       - Tables with > 1M rows: partition by the first DATE or TIMESTAMP
         column found; if none exists, use _PARTITIONTIME pseudo-column
-      - Tables with ≤ 1M rows: no partitioning needed
+      - Tables with <= 1M rows: no partitioning needed
 
     Apply BigQuery clustering rules:
       - Cluster on columns that appear in WHERE clauses of stored procedures
@@ -150,12 +209,11 @@ convert_schemas_task:
 
     ## STEP 3 — Create BigQuery Tables (Bronze SRC/src objects FIRST)
     Execute BigQuery DDL using the create_table tool with this strict order:
-      Process ONLY tables and views whose Oracle name starts with "SRC" or "src" first —
-      these are the raw landing objects in the Bronze layer.
+      Process ONLY tables and views whose Oracle name starts with "SRC" or "src" first.
       Do NOT create BigQuery tables for non-SRC tables or views in this step;
       those are handled by dbt models in later steps.
 
-    For every Bronze (SRC/src) object, generate and execute a BigQuery CREATE TABLE statement:
+    For every Bronze (SRC/src) object, generate and execute a BigQuery CREATE TABLE:
       CREATE TABLE IF NOT EXISTS `{gcp_project}.{bq_dataset}.<table_name_lower>`
       (
         <column_name> <bq_type> [OPTIONS(description="<oracle_col_comment>")],
@@ -163,27 +221,16 @@ convert_schemas_task:
       )
       [PARTITION BY <partition_col> | _PARTITIONTIME]
       [CLUSTER BY <col1>, <col2>, ...]
-      OPTIONS (
-        description = "<oracle_table_comment_if_any>"
-      );
+      OPTIONS (description = "<oracle_table_comment_if_any>");
 
-    BigQuery table names must be lowercase snake_case versions of the
-    Oracle table name (e.g. SRC_CUSTOMERS → src_customers).
+    BigQuery table names must be lowercase snake_case of the Oracle name.
 
     ## STEP 4 — Generate sources.yml (Bronze layer ONLY)
-    After ALL Bronze BigQuery tables have been created successfully, generate a
-    single models/bronze/sources.yml file. This file is the dbt source
-    declaration for the Bronze (raw) layer in the medallion architecture.
+    Generate models/bronze/sources.yml. Include ONLY SRC/src-prefixed objects.
 
-    IMPORTANT: Include ONLY tables and views whose Oracle name starts with
-    "SRC" or "src" in sources.yml. Non-SRC tables and views are NOT raw
-    sources — they are dbt models and must be referenced via ref(), never source().
-
-    The file must follow this exact structure:
       version: 2
-
       sources:
-        - name: <bq_dataset>              # logical source name = dataset name
+        - name: <bq_dataset>
           database: {gcp_project}
           schema: {bq_dataset}
           description: "Raw Bronze layer — Oracle migration landing tables"
@@ -195,251 +242,244 @@ convert_schemas_task:
                 - name: <column_name>
                   description: "<oracle_col_comment_or_type_mapping_note>"
                   tests:
-                    - not_null      # add for all primary key columns only
-                    - unique        # add for all primary key columns only
-              # add for partitioned tables only:
+                    - not_null   # PK columns only
+                    - unique     # PK columns only
               meta:
-                partition_column: "<partition_col>"
-                clustering_columns: ["<col1>", "<col2>"]
+                partition_column: "<partition_col>"       # partitioned tables only
+                clustering_columns: ["<col1>", "<col2>"]  # clustered tables only
 
     ## STEP 5 — Generate dbt Model SQL Files (Medallion Folder Structure)
-    Place every generated dbt model .sql file under the correct medallion
-    sub-folder inside the models/ directory:
 
       models/
-        bronze/         ← Bronze models: thin SELECT wrappers over source() refs
-          sources.yml   ← source declarations for SRC/src tables only
-          <src_table>.sql
-        silver/         ← Silver models: transformations referencing bronze via ref()
+        bronze/
+          sources.yml
+          <src_table>.sql    ← thin source() wrapper
+        silver/
           schema.yml
-          <silver_model>.sql
-        gold/           ← Gold models: aggregations referencing silver (or bronze) via ref()
+          <silver_model>.sql ← ref() only
+        gold/
           schema.yml
-          <gold_model>.sql
+          <gold_model>.sql   ← ref() only
 
-    ### Bronze models (models/bronze/<table_name_lower>.sql)
-    For each SRC/src table, write a thin passthrough model that reads from
-    the dbt source declaration:
-
+    Bronze model template (models/bronze/<table_name_lower>.sql):
       {{
-          config(
-              materialized = 'table',
-              tags         = ['bronze', 'raw']
-          )
+          config(materialized='table', tags=['bronze','raw'])
       }}
+      select <explicit column list>
+      from {{ source('<bq_dataset>', '<table_name_lower>') }}
 
-      select
-          {%- for col in columns %}
-          {{ col.name }}{% if not loop.last %},{% endif %}
-          {%- endfor %}
-      from
-          {{ source('<bq_dataset>', '<table_name_lower>') }}
-
-    ### Silver models (models/silver/<model_name_lower>.sql)
-    For Oracle views and tables classified as SILVER in the medallion layer:
-      - Write transformation SQL that references Bronze tables using ref()
-      - NEVER use source() inside Silver models — always use ref('bronze_model_name')
-      - Apply all Oracle → BigQuery function translations (see convert_low_medium_procs_task)
-      - Example pattern:
-
+    Silver model template (models/silver/<model_name_lower>.sql):
       {{
-          config(
-              materialized = 'view',
-              tags         = ['silver']
-          )
+          config(materialized='view', tags=['silver'])
       }}
-
       with base as (
           select ...
           from {{ ref('<bronze_model_name>') }}
       )
-      select ...
-      from base
+      select ... from base
 
-    ### Gold models (models/gold/<model_name_lower>.sql)
-    For Oracle tables and views classified as GOLD in the medallion layer:
-      - Write aggregation/reporting SQL that references Silver (or Bronze) models via ref()
-      - NEVER use source() inside Gold models — always use ref('silver_model_name')
-      - Example pattern:
-
+    Gold model template (models/gold/<model_name_lower>.sql):
       {{
-          config(
-              materialized = 'table',
-              tags         = ['gold']
-          )
+          config(materialized='table', tags=['gold'])
       }}
-
       select ...
       from {{ ref('<silver_model_name>') }}
 
-    Rules (apply to ALL layers):
-      - NEVER write CREATE TABLE, CREATE VIEW, or any DDL inside .sql model files
-      - ONLY Bronze models may use source(); Silver and Gold models must use ref()
-      - Column list must be explicit — no SELECT *
-      - File name must exactly match the BigQuery table/model name (snake_case, lowercase)
-      - Every cross-layer reference must use ref(), never a raw dataset.table string
+    Rules (ALL layers):
+      - NEVER write DDL inside .sql model files
+      - ONLY Bronze models may use source()
+      - Silver and Gold models use ref() exclusively
+      - No SELECT * — column list must always be explicit
+      - File name must match BigQuery table name (snake_case, lowercase)
 
     ## STEP 6 — Update Migration Log
-    After each object completes Steps 3–5 successfully, update the migration
-    log with status=SCHEMA_CONVERTED for that object. If any step fails,
-    set status=SCHEMA_FAILED and record the full error detail.
+    Update status=SCHEMA_CONVERTED on success or status=SCHEMA_FAILED with
+    full error detail on failure.
 
-    Target BigQuery dataset: {bq_dataset}
-    Target GCP project: {gcp_project}
+    Target dataset: {bq_dataset} | Project: {gcp_project}
 
   expected_output: >
     A schema conversion report containing:
 
     1. TABLE CREATION SUMMARY
        - Count of SRC/src Bronze tables created in BigQuery
-       - Count of Silver and Gold models generated as dbt SQL files (no BigQuery DDL)
+       - Count of Silver and Gold models generated as dbt SQL files
        - Count of objects that failed with full error details
 
     2. TYPE MAPPING DECISIONS
-       - A list of all non-trivial mapping decisions, especially:
-         * Every NUMBER without precision/scale mapped to FLOAT64 (with warning)
-         * Any CLOB/BLOB conversions that may need downstream handling
+       - Every NUMBER without precision mapped to FLOAT64 (with warning)
+       - Any CLOB/BLOB conversions flagged for downstream review
 
     3. PARTITIONING & CLUSTERING SUMMARY
-       - List of Bronze tables that received partitioning with the chosen column
-       - List of Bronze tables that received clustering with the chosen columns
+       - Tables partitioned with chosen column
+       - Tables clustered with chosen columns
 
     4. DBT SOURCES CONFIRMATION
-       - Confirmation that models/bronze/sources.yml has been written
-       - Count of source table entries in sources.yml (SRC/src tables ONLY)
-       - Confirmation that all primary key columns have not_null + unique tests
-       - Confirmation that NO non-SRC tables or views appear in sources.yml
+       - Confirmation models/bronze/sources.yml written with SRC/src entries only
+       - PK columns have not_null + unique tests
+       - No non-SRC objects in sources.yml
 
     5. DBT MODEL FILES CONFIRMATION
-       - Count of .sql files written to models/bronze/
-       - Count of .sql files written to models/silver/
-       - Count of .sql files written to models/gold/
-       - Confirmation that Bronze models use source(), Silver/Gold models use ref()
-       - List of any cross-layer ref() relationships
+       - .sql file counts per layer (bronze / silver / gold)
+       - Bronze uses source(); Silver/Gold use ref()
+       - Cross-layer ref() relationships listed
 
     6. MIGRATION LOG STATUS
-       - Count of objects with status=SCHEMA_CONVERTED
-       - Count of objects with status=SCHEMA_FAILED and their error details
+       - Count of SCHEMA_CONVERTED and SCHEMA_FAILED objects
 
   agent: schema_conversion_agent
   context:
     - discover_oracle_schema_task
     - classify_complexity_task
 
-convert_low_medium_procs_task:
+convert_procs_task:
   description: >
-    Convert all Oracle stored procedures and functions classified as LOW or
-    MEDIUM complexity into dbt models targeting BigQuery. Every procedure and
-    function — regardless of whether it encapsulates helper logic or produces
-    a full result set — must become a dbt model SQL file. No dbt macros are to
-    be created. Process objects strictly in the dependency-sorted order from
-    the classification manifest. Do not process a MEDIUM object until all
-    objects in its depends_on list have status=GENERATED or higher.
+    Convert all Oracle procedures and functions with a non-DISCARD, non-HIGH
+    migration_strategy into their correct dbt artifact. Process objects in
+    the dependency-sorted order from the classification manifest. Skip any
+    object until all items in its depends_on list have status=GENERATED or
+    status=DISCARDED.
 
-    For EACH LOW or MEDIUM procedure or function, follow this exact sequence:
+    Objects with migration_strategy=DISCARD are already marked — skip them.
+    No artifact is generated for discarded objects.
 
-    1. Read the full PL/SQL source using get_proc_body.
-    2. Load schema_map.json for type mapping rules.
-    3. Load the relevant few-shot examples using read_few_shots with the
-       object type as the key (procedure / function).
-    4. Determine the target medallion layer for the output model:
-         - Procedures/functions that read exclusively from Bronze (SRC/src)
-           tables and produce an enriched or transformed result set
-           → place in models/silver/<object_name_lower>.sql
-         - Procedures/functions that aggregate Silver (or Silver + Bronze)
-           data for reporting or KPI outputs
-           → place in models/gold/<object_name_lower>.sql
-         - If the layer cannot be determined from dependencies alone,
-           default to models/silver/ and flag the decision in the migration log.
+    ── PATH 1: INCREMENTAL_MODEL (proc_pattern=MERGE_UPSERT) ────────────────
+    The MERGE INTO logic becomes a dbt incremental model on the target table.
 
-    5. Apply these Oracle → BigQuery conversion rules to all generated SQL:
-         CURSOR FOR loop        → CTE or subquery
-         MERGE INTO             → BigQuery MERGE INTO with USING clause
-         NVL(a, b)              → IFNULL(a, b)
-         DECODE(x, v1,r1, ...)  → CASE WHEN x=v1 THEN r1 ... END
-         SYSDATE                → CURRENT_DATETIME()
-         SEQUENCE.NEXTVAL       → GENERATE_UUID() or farm_fingerprint
-         ROWNUM                 → ROW_NUMBER() OVER (ORDER BY ...)
-         || string concat       → CONCAT(a, b)
-         TO_DATE(str, fmt)      → PARSE_DATETIME(fmt, str)
-         TRUNC(date)            → DATE(datetime_col)
-         ADD_MONTHS(d, n)       → DATE_ADD(d, INTERVAL n MONTH)
-         IN/OUT parameters      → resolved as CTEs or intermediate SELECT
-                                   expressions within the model body
-         Procedure CALL chains  → resolved via ref() to the upstream model
-                                   that was converted from the called procedure
+    1. Identify the MERGE target table and unique_key from the ON clause.
+    2. Determine the target table's medallion layer (SILVER or GOLD).
+    3. Write models/<layer>/<target_table_lower>.sql:
 
-    6. Write the dbt model SQL file with this structure:
-         {{
-             config(
-                 materialized = 'table',       -- LOW complexity procedures
-                 -- OR --
-                 materialized = 'incremental', -- MEDIUM complexity procedures
-                 unique_key   = '<primary_key_column>',
-                 tags         = ['silver']     -- or ['gold'] per layer
-             )
-         }}
+       {{
+           config(
+               materialized='incremental',
+               unique_key='<key_column>',
+               incremental_strategy='merge',
+               tags=['<layer>']
+           )
+       }}
+       -- Converted from Oracle procedure: <PROC_NAME>
+       -- Pattern: MERGE INTO replaced by dbt incremental materialisation
+       with source as (
+           select ...
+           from {{ ref('<upstream_model>') }}
+           {% if is_incremental() %}
+           where updated_at > (select max(updated_at) from {{ this }})
+           {% endif %}
+       )
+       select <explicit column list> from source
 
-         -- Converted from Oracle procedure: <ORIGINAL_PROCEDURE_NAME>
-         -- Conversion notes: <inline description of key decisions made>
+    4. The procedure itself generates no separate artifact.
+    5. Append entry to models/<layer>/schema.yml.
 
-         with <cte_name> as (
-             select ...
-             from {{ ref('<upstream_bronze_or_silver_model>') }}
-         )
-         select
-             <explicit column list — no SELECT *>
-         from <cte_name>
+    ── PATH 2: DBT_SNAPSHOT (proc_pattern=SCD_TYPE_2) ───────────────────────
+    The SCD Type 2 history logic becomes a dbt snapshot.
 
-       Rules for model SQL:
-         - NEVER use source() — all upstream references must use ref()
-         - NEVER write raw dataset.table strings
-         - NEVER include DDL (CREATE TABLE, CREATE VIEW, etc.)
-         - All upstream Bronze models must be referenced as
-           {{ ref('<bronze_model_name>') }}
-         - All upstream Silver models (including those converted from
-           other procedures) must be referenced as
-           {{ ref('<silver_model_name>') }}
-         - Column list must be explicit — no SELECT *
-         - Every key conversion decision must be documented in an
-           inline SQL comment at the point of conversion
+    1. Identify source table, unique_key, and updated_at column.
+    2. Write snapshots/<source_table_lower>_snapshot.sql:
 
-    7. Generate or append to the appropriate schema.yml:
-         - models/silver/schema.yml  for Silver models
-         - models/gold/schema.yml    for Gold models
-         Each entry must include:
-           - model name and description derived from the original procedure name
-             and purpose
-           - Column descriptions for every output column
-           - not_null test on every non-nullable column
-           - unique test on every primary key column
-           - relationships test for every foreign key identified
-         Append to the file — do NOT overwrite existing entries.
+       {% snapshot <source_table_lower>_snapshot %}
+       {{
+           config(
+               target_schema='{bq_dataset}',
+               unique_key='<key_column>',
+               strategy='timestamp',
+               updated_at='<updated_at_column>',
+               -- OR: strategy='check', check_cols=['col1','col2'],
+               tags=['snapshot','scd2']
+           )
+       }}
+       select <explicit column list>
+       from {{ ref('<source_bronze_or_silver_model>') }}
+       {% endsnapshot %}
 
-    8. Update migration log: status=GENERATED, artifact_type=MODEL,
-       artifact_path=<relative path>, medallion_layer=<SILVER or GOLD>,
-       materialization=<table or incremental>.
+    3. Append entry to snapshots/schema.yml documenting dbt_scd_id,
+       dbt_valid_from, dbt_valid_to, dbt_updated_at columns.
+    4. The procedure itself generates no separate artifact.
 
-    Process objects in batches of 10. After each batch, write a progress
-    update to the migration log before continuing.
+    ── PATH 3: DBT_MACRO (proc_pattern=HELPER_FUNCTION) ─────────────────────
+    Oracle scalar functions become Jinja macros.
+
+    1. Read function body and translate to BigQuery SQL.
+    2. Write macros/<function_name_lower>.sql:
+
+       {#
+         Converted from Oracle function: <FUNCTION_NAME>
+         Parameters: <param1> (<type>), ...
+         Returns: <description>
+       #}
+       {% macro <function_name_lower>(<param1>, ...) %}
+           <BigQuery SQL expression>
+       {% endmacro %}
+
+    3. No config() block — macros are not materialised.
+    4. Call from models as {{ function_name_lower(...) }}.
+
+    ── PATH 4: DBT_MODEL (proc_pattern=UNIQUE_LOGIC) ─────────────────────────
+    Procedures with business logic not captured elsewhere become dbt models.
+
+    1. Determine medallion layer from dependency chain.
+    2. Write models/<layer>/<proc_name_lower>.sql:
+
+       {{
+           config(
+               materialized='table',        -- LOW complexity
+               -- OR materialized='incremental', unique_key='<pk>', -- MEDIUM
+               tags=['<layer>']
+           )
+       }}
+       -- Converted from Oracle procedure: <PROC_NAME>
+       with <cte> as (
+           select ... from {{ ref('<upstream_model>') }}
+       )
+       select <explicit column list> from <cte>
+
+    3. Append entry to models/<layer>/schema.yml.
+
+    ── SQL CONVERSION RULES (apply to ALL paths) ────────────────────────────
+      CURSOR FOR loop        → CTE or subquery
+      NVL(a, b)              → IFNULL(a, b)
+      NVL2(a, b, c)          → IF(a IS NOT NULL, b, c)
+      DECODE(x, v1,r1, ...)  → CASE WHEN x=v1 THEN r1 ... END
+      SYSDATE                → CURRENT_DATETIME()
+      SEQUENCE.NEXTVAL       → GENERATE_UUID() or FARM_FINGERPRINT(...)
+      ROWNUM                 → ROW_NUMBER() OVER (ORDER BY ...)
+      || string concat       → CONCAT(a, b)
+      TO_DATE(str, fmt)      → PARSE_DATETIME(fmt, str)
+      TO_CHAR(date, fmt)     → FORMAT_DATETIME(fmt, datetime_col)
+      TRUNC(date)            → DATE(datetime_col)
+      ADD_MONTHS(d, n)       → DATE_ADD(d, INTERVAL n MONTH)
+      MONTHS_BETWEEN(d1,d2)  → DATE_DIFF(d1, d2, MONTH)
+      INSTR(s, sub)          → STRPOS(s, sub)
+      RAISE_APPLICATION_ERROR → Remove; replace with dbt test or comment
+      DBMS_OUTPUT.PUT_LINE   → Remove entirely
+
+    Rules for ALL artifacts:
+      - NEVER use source() in Silver/Gold models, snapshots, or macros
+      - NEVER write raw dataset.table strings — always use ref()
+      - NEVER include DDL in model, snapshot, or macro files
+      - Explicit column lists only — no SELECT *
+      - Macro calls from models use {{ macro_name(...) }}
+      - Every key conversion decision documented in an inline SQL comment
+
+    ── MIGRATION LOG UPDATE ─────────────────────────────────────────────────
+    After each artifact: status=GENERATED, artifact_type=(INCREMENTAL_MODEL |
+    DBT_SNAPSHOT | DBT_MACRO | DBT_MODEL), artifact_path=<relative path>,
+    medallion_layer=<SILVER | GOLD | SNAPSHOT | MACRO>.
+    Process in batches of 10; write progress to migration log after each batch.
 
   expected_output: >
-    A code generation report containing:
-    - Count of Oracle procedures/functions converted to dbt models,
-      broken down by models/silver/ and models/gold/
-    - Count of LOW complexity procedures materialised as 'table'
-    - Count of MEDIUM complexity procedures materialised as 'incremental'
-    - Count of objects that failed conversion with specific error messages
-    - List of every model file written with its full relative path and
-      assigned medallion layer
-    - List of conversion decisions made (e.g., "CURSOR loop at line 45
-      converted to CTE named ranked_orders", "IN/OUT parameter RESULT_SET
-      resolved as final SELECT output", "procedure call to CALC_TOTALS
-      resolved via ref('calc_totals')")
-    - List of inter-procedure ref() chains created (procedure A model
-      references procedure B model via ref())
-    - Any objects skipped because their dependencies were not yet migrated,
-      with the blocking dependency named
+    A procedure conversion report containing:
+    - Count of DISCARDED objects (replaced by dbt run) — listed by name
+    - Count of INCREMENTAL_MODEL artifacts written (with paths)
+    - Count of DBT_SNAPSHOT artifacts written (with paths)
+    - Count of DBT_MACRO artifacts written (with paths)
+    - Count of DBT_MODEL artifacts written (with paths)
+    - Count of objects that failed conversion with error details
+    - Full list of every artifact written with relative path and artifact_type
+    - Key conversion decisions (e.g. "MERGE ON clause → unique_key='order_id'",
+      "SCD2 timestamp strategy on updated_at", "NVL → IFNULL at line 22")
+    - Objects skipped due to unresolved dependencies, with blocking name
   agent: codegen_agent
   context:
     - classify_complexity_task
@@ -448,234 +488,93 @@ convert_low_medium_procs_task:
 validate_migrations_task:
   description: >
     Validate every object with status=GENERATED in the migration log.
-    Process validations in the same dependency-sorted order used for
-    generation. Do not validate an object until all objects in its
-    depends_on list have status=VALIDATED or higher.
+    Skip all objects with status=DISCARDED — no validation needed.
+    Process in the same dependency-sorted order used during conversion.
+    Do not validate an object until all depends_on items have
+    status=VALIDATED or status=DISCARDED.
 
-    For EACH generated object, run these three checks IN ORDER. Stop and
-    record FAIL if any check fails — do not proceed to the next check:
+    ── FOR INCREMENTAL_MODEL and DBT_MODEL ──────────────────────────────────
 
-    CHECK 1 — SQL syntax validation:
-      - Call dry_run_bq with the full content of the generated .sql model file
-      - If dry run fails: record FAIL with reason="SYNTAX_ERROR" and
-        the exact BigQuery error message
-      - If dry run passes: proceed to Check 2
+    CHECK 1 — SQL syntax dry-run:
+      - dry_run_bq on full model SQL
+      - FAIL: reason="SYNTAX_ERROR" with exact BigQuery error
 
     CHECK 2 — Row count reconciliation:
-      - Call count_rows_oracle for the source procedure output or table
-      - Call count_rows_bq for the target BigQuery table materialised by
-        the dbt model
-      - Calculate difference percentage:
-          diff_pct = abs(oracle - bq) / oracle * 100
-      - If diff_pct > 0.01: record FAIL with reason="COUNT_MISMATCH",
-        oracle_count, bq_count, diff_pct
-      - If diff_pct <= 0.01: proceed to Check 3
+      - count_rows_oracle vs count_rows_bq
+      - diff_pct = abs(oracle - bq) / oracle * 100
+      - FAIL: reason="COUNT_MISMATCH" if diff_pct > 0.01
 
-    CHECK 3 — Column-level sample validation:
-      - Call sample_rows_oracle(n=50) on the source procedure output
-      - Call execute_bq with a SELECT matching the same 50 primary keys
-        from the materialised dbt model table
-      - Compare values for all non-nullable columns
-      - If any column value mismatches on more than 2% of sampled rows:
-          record FAIL with reason="DATA_MISMATCH", column_name,
-          sample_oracle_value, sample_bq_value
-      - If all columns match within tolerance: record PASS
+    CHECK 3 — Column-level sample:
+      - sample_rows_oracle(n=50) vs execute_bq on same 50 PKs
+      - FAIL: reason="DATA_MISMATCH" if > 2% of rows differ on any
+        non-nullable column; record column_name, oracle_value, bq_value
 
-    Additionally, for ALL generated models (Bronze, Silver, and Gold),
-    enforce these lineage integrity checks before recording any PASS:
-      - No raw dataset.table references exist anywhere in the model SQL
-        (every upstream reference must use ref() or source())
-      - source() is used ONLY in Bronze models — Silver and Gold models
-        must use ref() exclusively
-      - Every ref('<model_name>') call points to a model file that
-        actually exists under models/bronze/, models/silver/, or
-        models/gold/ — flag any ref() pointing to a non-existent model
-        as reason="INVALID_REF"
-      - No procedure-originated model contains any DDL statements
-        (CREATE TABLE, CREATE VIEW, INSERT, etc.)
+    ── FOR DBT_SNAPSHOT ─────────────────────────────────────────────────────
+
+    CHECK 1 — Snapshot SQL dry-run:
+      - Render snapshot SELECT body and dry_run_bq
+      - FAIL: reason="SYNTAX_ERROR"
+
+    CHECK 2 — Snapshot history validation:
+      - Verify dbt_scd_id, dbt_valid_from, dbt_valid_to, dbt_updated_at
+        columns exist in snapshot target table
+      - Verify at least one history record (dbt_valid_to IS NOT NULL) exists
+        for any updated Oracle source row
+      - FAIL: reason="SNAPSHOT_HISTORY_INVALID"
+
+    ── FOR DBT_MACRO ────────────────────────────────────────────────────────
+
+    CHECK 1 — Macro render and dry-run:
+      - Render macro with representative sample argument values
+      - dry_run_bq on rendered SQL expression
+      - FAIL: reason="SYNTAX_ERROR"
+
+    CHECK 2 — Output equivalence:
+      - execute_oracle_function with same sample arguments
+      - Compare Oracle output to BigQuery macro output
+      - FAIL: reason="MACRO_OUTPUT_MISMATCH"
+
+    ── LINEAGE INTEGRITY (ALL artifact types) ───────────────────────────────
+    Before recording any PASS:
+      - No raw dataset.table strings in any artifact SQL
+        → FAIL: reason="INVALID_REF"
+      - source() only in Bronze model files; never in Silver/Gold/snapshots
+        → FAIL: reason="INVALID_REF"
+      - Every ref('<name>') resolves to an existing file under models/
+        → FAIL: reason="INVALID_REF"
+      - No DDL statements in any model, snapshot, or macro file
+        → FAIL: reason="DDL_IN_ARTIFACT"
+      - Every {{ macro_name(...) }} in a model resolves to a file in macros/
+        → FAIL: reason="UNRESOLVED_MACRO"
 
     On PASS:
-      - Set confidence = 1.0
-      - Update migration log: status=VALIDATED, validation_result=PASS
-      - Append result to validation_report.json
+      - confidence=1.0, status=VALIDATED, validation_result=PASS
+      - Append to validation_report.json
 
     On FAIL:
-      - Increment retry_count for the object
-      - If retry_count < 3: update migration log status=FAILED_VALIDATION
-        so codegen_agent will retry
-      - If retry_count >= 3: update migration log status=HUMAN_REVIEW
-      - Append result to validation_report.json with full failure details
+      - Increment retry_count
+      - retry_count < 3  → status=FAILED_VALIDATION (codegen_agent retries)
+      - retry_count >= 3 → status=HUMAN_REVIEW
+      - Append to validation_report.json with full failure details
 
   expected_output: >
     A validation report containing:
-    - Total objects validated, broken down by BRONZE / SILVER / GOLD layer
-    - Count of PASS results with average confidence score
-    - Count of FAIL results broken down by failure type:
-        SYNTAX_ERROR / COUNT_MISMATCH / DATA_MISMATCH / INVALID_REF / DDL_IN_MODEL
-    - Count of objects escalated to HUMAN_REVIEW after 3 retries
-    - For each FAIL: object name, medallion layer, original Oracle object type
-      (TABLE / VIEW / PROCEDURE / FUNCTION), check that failed, exact failure
-      reason, retry count
-    - Confirmation that all Silver/Gold models use ref() exclusively
-      (no source() calls, no raw dataset.table strings)
-    - Confirmation that no procedure-originated model contains DDL statements
-    - List of any inter-procedure ref() chains that were validated end-to-end
-    - Overall migration health score: percentage of objects fully validated
+    - Count of DISCARDED objects skipped (no validation needed)
+    - Total objects validated by artifact_type:
+        INCREMENTAL_MODEL / DBT_SNAPSHOT / DBT_MACRO / DBT_MODEL
+    - PASS count per artifact_type with average confidence score
+    - FAIL count by failure type:
+        SYNTAX_ERROR / COUNT_MISMATCH / DATA_MISMATCH /
+        SNAPSHOT_HISTORY_INVALID / MACRO_OUTPUT_MISMATCH /
+        INVALID_REF / DDL_IN_ARTIFACT / UNRESOLVED_MACRO
+    - Objects escalated to HUMAN_REVIEW after 3 retries
+    - Per FAIL: object name, artifact_type, layer, check failed,
+      exact reason, retry count
+    - Confirmation Silver/Gold/snapshots use ref() exclusively
+    - Confirmation no artifact contains DDL statements
+    - Confirmation all macro calls resolve to existing macro files
+    - Overall migration health score: % of generated objects validated
   agent: validator_agent
   context:
-    - convert_low_medium_procs_task
+    - convert_procs_task
     - convert_schemas_task
-
-supervise_migration_task:
-  description: >
-    Orchestrate and supervise the complete Oracle-to-BigQuery / dbt migration
-    for schema '{oracle_schema}'. You are the single control plane for the
-    entire pipeline. Execute the following phases in strict order, enforcing
-    all quality gates before advancing.
- 
-    ── PHASE 0: PRE-FLIGHT ──────────────────────────────────────────────────
-    Before delegating to any agent, perform these checks:
-      1. Read config using read_config to confirm the following are present
-         and non-empty: oracle_schema, gcp_project, bq_dataset,
-         schema_map.json path, few_shots directory path.
-      2. Verify Oracle connectivity by calling list_tables with a limit of 1.
-         If it fails, halt immediately with reason="ORACLE_UNREACHABLE".
-      3. Verify BigQuery connectivity by calling count_rows_bq on any
-         known-good table or the information schema. If it fails, halt with
-         reason="BIGQUERY_UNREACHABLE".
-      4. Write a pre_flight_check entry to the migration log:
-         status=PRE_FLIGHT_PASSED or PRE_FLIGHT_FAILED with failure detail.
-      5. Proceed only on PRE_FLIGHT_PASSED.
- 
-    ── PHASE 1: DISCOVERY ───────────────────────────────────────────────────
-    Delegate discover_oracle_schema_task to discovery_agent.
-    On completion, enforce Quality Gate 1:
-      - Read migration log; count objects with status=DISCOVERED.
-      - Verify every object has a non-null medallion_layer.
-      - Verify every SRC/src object is tagged BRONZE.
-      - If any check fails: write blocking_issue, halt, escalate to operator.
-      - If all checks pass: write phase_summary for Phase 1, proceed.
- 
-    ── PHASE 2: CLASSIFICATION ──────────────────────────────────────────────
-    Delegate classify_complexity_task to classifier_agent.
-    On completion, enforce Quality Gate 2:
-      - Confirm every discovered object now has complexity + medallion_layer +
-        migration_strategy set.
-      - Confirm topological sort is valid (read dependency graph from log).
-      - Confirm all HIGH objects are written to human_review_queue.
-      - If any check fails: write blocking_issue, halt, escalate.
-      - If all pass: emit updated human_review_queue report, write phase_summary,
-        proceed.
- 
-    ── PHASE 3: SCHEMA CONVERSION ───────────────────────────────────────────
-    Delegate convert_schemas_task to schema_conversion_agent.
-    On completion, enforce Quality Gate 3:
-      - Confirm models/bronze/sources.yml exists.
-      - Confirm sources.yml contains ONLY SRC/src entries — read its content
-        and flag any non-SRC table found inside it.
-      - Confirm models/bronze/, models/silver/, models/gold/ directories exist
-        and contain at least one .sql file each (or log a warning if a layer
-        is empty with justification).
-      - Scan all .sql files under models/silver/ and models/gold/ for any
-        source() call — flag every occurrence as a blocking issue.
-      - Confirm zero SCHEMA_FAILED objects are unaddressed.
-      - If any check fails: write blocking_issue, halt, escalate.
-      - If all pass: write phase_summary, proceed.
- 
-    ── PHASE 4: CODE GENERATION ─────────────────────────────────────────────
-    Delegate convert_low_medium_procs_task to codegen_agent.
-    On completion, enforce Quality Gate 4:
-      - Confirm every LOW/MEDIUM object has status=GENERATED.
-      - For each object with migration_strategy=dbt_macro: confirm a file
-        exists at macros/<object_name_lower>.sql.
-      - For each object with migration_strategy=dbt_model: confirm a .sql
-        file exists in models/silver/ or models/gold/ matching its layer.
-      - Scan all generated model files for raw dataset.table strings — flag
-        every occurrence as a blocking issue.
-      - Confirm schema.yml entries exist for every generated model.
-      - Emit updated human_review_queue report (any new HUMAN_REVIEW items
-        added during generation).
-      - If any check fails: write blocking_issue, halt, escalate.
-      - If all pass: write phase_summary, proceed.
- 
-    ── PHASE 5: VALIDATION ──────────────────────────────────────────────────
-    Delegate validate_migrations_task to validator_agent.
-    On completion, enforce Quality Gate 5:
-      - Confirm every generated object has status=VALIDATED or
-        status=HUMAN_REVIEW (no object left in GENERATED or
-        FAILED_VALIDATION without retry_count >= 3).
-      - Calculate overall pass rate = VALIDATED / (VALIDATED + HUMAN_REVIEW).
-      - If pass rate < 0.95: write blocking_issue with all failing objects
-        listed; halt and escalate to operator.
-      - Confirm lineage integrity: no source() in Silver/Gold, no raw table
-        strings in any model, all macro calls resolve.
-      - If all checks pass: write phase_summary for Phase 5, proceed to
-        Phase 6.
- 
-    ── PHASE 6: FINAL SIGN-OFF ──────────────────────────────────────────────
-    Read the full migration log one final time. Confirm:
-      - Every object discovered in Phase 1 has a terminal status:
-        VALIDATED, HUMAN_REVIEW, or SCHEMA_FAILED (with a recorded reason).
-      - Human review queue is finalised and prioritised.
-      - No object is in an intermediate status (DISCOVERED, GENERATED,
-        FAILED_VALIDATION) without an explicit escalation record.
-    If confirmed: produce the Final Migration Completion Report (see
-    expected_output) and write status=MIGRATION_COMPLETE to the migration log.
-    If not confirmed: write blocking_issue for every unresolved object and
-    escalate before emitting any completion report.
- 
-  expected_output: >
-    A structured Final Migration Completion Report containing all of the
-    following sections:
- 
-    ── SECTION 1: EXECUTIVE SUMMARY ─────────────────────────────────────────
-    - Migration project: {oracle_schema} → {gcp_project}.{bq_dataset}
-    - Overall status: COMPLETE / PARTIALLY COMPLETE / BLOCKED
-    - Total objects discovered vs total objects successfully migrated
-    - Overall automation rate (% fully auto-converted without human intervention)
-    - Total objects escalated to human review with top-level reasons
-    - Pipeline duration per phase (if timestamps are available in the log)
- 
-    ── SECTION 2: OBJECT INVENTORY BY LAYER & STATUS ────────────────────────
-    A table covering every discovered object with columns:
-      object_name | object_type | medallion_layer | complexity |
-      migration_strategy | artifact_path | final_status | validation_result
- 
-    ── SECTION 3: QUALITY GATE AUDIT TRAIL ──────────────────────────────────
-    For each of the 5 quality gates: PASS or FAIL, with the list of checks
-    that passed and any that failed (even if subsequently resolved).
- 
-    ── SECTION 4: MEDALLION ARCHITECTURE SUMMARY ────────────────────────────
-    - Count of Bronze models in models/bronze/ with source() references
-    - Count of Silver models in models/silver/ with ref() references
-    - Count of Gold models in models/gold/ with ref() references
-    - Count of dbt macros written to macros/
-    - Confirmation that sources.yml contains only SRC/src entries
-    - Confirmation that no Silver/Gold model contains source() or a raw
-      dataset.table string
- 
-    ── SECTION 5: HUMAN REVIEW QUEUE (FINAL) ────────────────────────────────
-    Prioritised list of every object requiring human attention:
-      object_name | type | layer | complexity | reason | recommended_action
-    If empty: state "No objects require human review."
- 
-    ── SECTION 6: BLOCKING ISSUES LOG ───────────────────────────────────────
-    Every blocking issue raised during the pipeline, its phase, resolution
-    status (RESOLVED / OPEN), and the operator action taken.
-    If none: state "No blocking issues were raised."
- 
-    ── SECTION 7: RECOMMENDATIONS ───────────────────────────────────────────
-    Ordered list of post-migration actions:
-    - Any HIGH complexity objects still requiring manual PL/SQL conversion
-    - Any SCHEMA_FAILED objects needing DDL review
-    - Any data quality issues surfaced during validation
-    - Suggested dbt tests to add for ongoing data quality monitoring
-    - Suggested BigQuery optimisations (partitioning, clustering) not yet applied
- 
-  agent: supervisor_agent
-  context:
-    - discover_oracle_schema_task
-    - classify_complexity_task
-    - convert_schemas_task
-    - convert_low_medium_procs_task
-    - validate_migrations_task

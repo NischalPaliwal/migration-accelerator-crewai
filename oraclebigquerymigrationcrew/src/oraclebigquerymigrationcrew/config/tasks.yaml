@@ -578,3 +578,136 @@ validate_migrations_task:
   context:
     - convert_procs_task
     - convert_schemas_task
+
+supervise_migration_task:
+  description: >
+    Orchestrate and supervise the complete Oracle-to-BigQuery / dbt migration
+    for schema '{oracle_schema}'. Execute the following phases in strict order,
+    enforcing all quality gates before advancing.
+ 
+    ── PHASE 0: PRE-FLIGHT ──────────────────────────────────────────────────
+    1. read_config to confirm oracle_schema, gcp_project, bq_dataset,
+       schema_map.json path, and few_shots directory are present and non-empty.
+    2. list_tables (limit 1) to verify Oracle connectivity.
+       Halt with reason="ORACLE_UNREACHABLE" on failure.
+    3. count_rows_bq on information schema to verify BigQuery connectivity.
+       Halt with reason="BIGQUERY_UNREACHABLE" on failure.
+    4. Write pre_flight_check to migration log:
+       status=PRE_FLIGHT_PASSED or PRE_FLIGHT_FAILED with detail.
+    5. Proceed only on PRE_FLIGHT_PASSED.
+ 
+    ── PHASE 1: DISCOVERY ───────────────────────────────────────────────────
+    Delegate discover_oracle_schema_task to discovery_agent.
+    Quality Gate 1:
+      - Every object has status=DISCOVERED with non-null medallion_layer.
+      - Every procedure/function has a non-null proc_pattern tag.
+      - All SRC/src objects tagged BRONZE.
+      FAIL → blocking_issue, halt, escalate.
+      PASS → phase_summary Phase 1, proceed.
+ 
+    ── PHASE 2: CLASSIFICATION ──────────────────────────────────────────────
+    Delegate classify_complexity_task to classifier_agent.
+    Quality Gate 2:
+      - Every procedure/function has a migration_strategy.
+      - Every DISCARD has status=DISCARDED and discard_reason set.
+      - Topological sort valid; HIGH objects in human_review_queue.
+      FAIL → blocking_issue, halt, escalate.
+      PASS → emit human_review_queue report, phase_summary Phase 2, proceed.
+ 
+    ── PHASE 3: SCHEMA CONVERSION ───────────────────────────────────────────
+    Delegate convert_schemas_task to schema_conversion_agent.
+    Quality Gate 3:
+      - sources.yml exists with SRC/src entries only — scan for non-SRC entries.
+      - bronze/, silver/, gold/ model directories exist with .sql files.
+      - Zero source() calls in Silver/Gold model files.
+      - Zero unaddressed SCHEMA_FAILED objects.
+      FAIL → blocking_issue, halt, escalate.
+      PASS → phase_summary Phase 3, proceed.
+ 
+    ── PHASE 4: CODE GENERATION ─────────────────────────────────────────────
+    Delegate convert_procs_task to codegen_agent.
+    Quality Gate 4:
+      - Every non-DISCARD, non-HIGH object has status=GENERATED.
+      - Correct artifact file exists for each artifact_type and layer.
+      - Zero generated files contain raw dataset.table strings.
+      - schema.yml / snapshots/schema.yml entries exist for every artifact.
+      - Emit updated human_review_queue report.
+      FAIL → blocking_issue, halt, escalate.
+      PASS → phase_summary Phase 4, proceed.
+ 
+    ── PHASE 5: VALIDATION ──────────────────────────────────────────────────
+    Delegate validate_migrations_task to validator_agent.
+    Quality Gate 5:
+      - Every generated object has status=VALIDATED or HUMAN_REVIEW.
+      - pass_rate = VALIDATED / (VALIDATED + HUMAN_REVIEW) >= 0.95.
+        Below 0.95 → blocking_issue, halt, escalate.
+      - All Silver/Gold/snapshots confirmed ref()-only.
+      - No artifacts contain DDL or unresolved macro calls.
+      PASS → phase_summary Phase 5, proceed to Phase 6.
+ 
+    ── PHASE 6: FINAL SIGN-OFF ──────────────────────────────────────────────
+    Read the full migration log. Confirm every discovered object has a
+    terminal status: VALIDATED, DISCARDED, HUMAN_REVIEW, or SCHEMA_FAILED
+    with a recorded reason. No object may be in an intermediate status.
+    If confirmed → produce Final Migration Completion Report and write
+    status=MIGRATION_COMPLETE to the migration log.
+    If not confirmed → write blocking_issue for every unresolved object
+    and escalate before emitting any completion report.
+ 
+  expected_output: >
+    Final Migration Completion Report with these sections:
+ 
+    ── SECTION 1: EXECUTIVE SUMMARY ─────────────────────────────────────────
+    - Migration: {oracle_schema} → {gcp_project}.{bq_dataset}
+    - Overall status: COMPLETE / PARTIALLY COMPLETE / BLOCKED
+    - Total objects discovered vs successfully migrated
+    - Total objects DISCARDED (replaced by dbt run cycle) — listed by name
+    - Overall automation rate (% fully auto-converted without human review)
+    - Total objects escalated to human review
+ 
+    ── SECTION 2: PROCEDURE MIGRATION STRATEGY BREAKDOWN ────────────────────
+    For every procedure and function:
+      object_name | proc_pattern | migration_strategy | artifact_type |
+      artifact_path | final_status
+    Clearly distinguish DISCARDs from generated artifacts.
+ 
+    ── SECTION 3: FULL OBJECT INVENTORY ─────────────────────────────────────
+    Every discovered object:
+      object_name | object_type | medallion_layer | complexity |
+      migration_strategy | artifact_path | final_status | validation_result
+ 
+    ── SECTION 4: QUALITY GATE AUDIT TRAIL ──────────────────────────────────
+    For each of the 5 quality gates: PASS or FAIL, checks passed/failed.
+ 
+    ── SECTION 5: MEDALLION ARCHITECTURE SUMMARY ────────────────────────────
+    - Bronze models count (source() refs, models/bronze/)
+    - Silver models count (ref() only, models/silver/)
+    - Gold models count (ref() only, models/gold/)
+    - Snapshots count (snapshots/)
+    - Macros count (macros/)
+    - Confirmation sources.yml contains only SRC/src entries
+    - Confirmation no Silver/Gold/snapshot artifact uses source() or raw strings
+ 
+    ── SECTION 6: HUMAN REVIEW QUEUE (FINAL) ────────────────────────────────
+    Prioritised list: object_name | type | proc_pattern | layer |
+    complexity | reason | recommended_action
+    If empty: "No objects require human review."
+ 
+    ── SECTION 7: BLOCKING ISSUES LOG ───────────────────────────────────────
+    Every blocking issue: phase, failed_check, resolution_status, operator action.
+    If none: "No blocking issues were raised."
+ 
+    ── SECTION 8: RECOMMENDATIONS ───────────────────────────────────────────
+    - HIGH complexity objects still requiring manual conversion
+    - SCHEMA_FAILED objects needing DDL review
+    - Data quality issues surfaced during validation
+    - Suggested dbt tests for ongoing data quality monitoring
+    - BigQuery optimisations not yet applied (partitioning, clustering)
+ 
+  agent: supervisor_agent
+  context:
+    - discover_oracle_schema_task
+    - classify_complexity_task
+    - convert_schemas_task
+    - convert_procs_task
+    - validate_migrations_task
